@@ -2,5 +2,6 @@ ccxt
 requests
 pandas
 numpy
-flask
 schedule
+flask
+tensorflow
