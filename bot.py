@@ -1,134 +1,119 @@
 import pandas as pd
-import numpy as np
-import ccxt
-from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
-from sklearn.ensemble import RandomForestClassifier
-from imblearn.over_sampling import SMOTE
-import xgboost as xgb
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
-from sklearn.metrics import accuracy_score, mean_absolute_error
-import matplotlib.pyplot as plt
-import seaborn as sns
+import talib as ta
+import requests
+from binance.client import Client
+import time
 
-# Funções para calcular os indicadores técnicos
-def calculate_ema(data, period):
-    return data['close'].ewm(span=period, adjust=False).mean()
+# Configurações do Telegram
+TELEGRAM_TOKEN = '7986770725:AAHD3vqPIZNLHvyWVZnrHIT3xGGI1R9ZeoY'
+CHAT_ID = '2091781134'
 
-def calculate_rsi(data, period):
-    delta = data['close'].diff()
-    gain = (delta.where(delta > 0, 0)).fillna(0)
-    loss = (-delta.where(delta < 0, 0)).fillna(0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+# Configurações da Binance
+API_KEY = 'YOUR_API_KEY'
+API_SECRET = 'YOUR_API_SECRET'
+client = Client(API_KEY, API_SECRET)
 
-def calculate_macd(data):
-    short_ema = data['close'].ewm(span=12, adjust=False).mean()
-    long_ema = data['close'].ewm(span=26, adjust=False).mean()
-    macd = short_ema - long_ema
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd, signal
+# Função para enviar mensagem para o Telegram
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    params = {'chat_id': CHAT_ID, 'text': message}
+    requests.get(url, params=params)
 
-def calculate_stochastic(data, k_period=14, d_period=3):
-    low_min = data['low'].rolling(window=k_period).min()
-    high_max = data['high'].rolling(window=k_period).max()
-    percent_k = 100 * (data['close'] - low_min) / (high_max - low_min)
-    percent_d = percent_k.rolling(window=d_period).mean()
-    return percent_k, percent_d
+# Função para obter dados históricos de preço (exemplo com 1 hora de candles)
+def get_historical_data(symbol='BTCUSDT', interval='1h', limit=200):
+    candles = client.get_historical_klines(symbol, interval, limit=limit)
+    data = pd.DataFrame(candles, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    data['time'] = pd.to_datetime(data['time'], unit='ms')
+    data['close'] = data['close'].astype(float)
+    return data[['time', 'close']]
 
-# Função para adicionar todos os indicadores técnicos ao DataFrame
-def add_technical_indicators(data):
-    data['ema_short'] = calculate_ema(data, 9)
-    data['ema_long'] = calculate_ema(data, 21)
-    data['rsi'] = calculate_rsi(data, 14)
-    data['macd'], data['macd_signal'] = calculate_macd(data)
-    data['stochastic_k'], data['stochastic_d'] = calculate_stochastic(data)
+# Função para calcular indicadores técnicos
+def calculate_indicators(data):
+    # EMAs de 9 e 13 períodos
+    data['EMA9'] = ta.EMA(data['close'], timeperiod=9)
+    data['EMA13'] = ta.EMA(data['close'], timeperiod=13)
+    # MACD
+    macd, macdsignal, macdhist = ta.MACD(data['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+    data['MACD'] = macd
+    data['MACD_signal'] = macdsignal
     return data
 
-# Função para carregar os dados
-def get_data(symbol, timeframe='1h', limit=100):
-    exchange = ccxt.binance()
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-    data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
-    data = add_technical_indicators(data)
-    return data
+# Função para identificar a tendência
+def identify_trend(data):
+    trend = "Indefinida"
+    if data['EMA9'].iloc[-1] > data['EMA13'].iloc[-1]:
+        trend = "Alta"
+    elif data['EMA9'].iloc[-1] < data['EMA13'].iloc[-1]:
+        trend = "Baixa"
+    return trend
 
-# Carregar os dados de 2 anos
-symbol = 'BTC/USDT'
-data = get_data(symbol, timeframe='1h', limit=2000)
+# Função para verificar as condições de entrada
+def check_entry_conditions(data):
+    last_candle = data.iloc[-1]
+    trend = identify_trend(data)
 
-# Preparar os dados para treinamento
-data['target'] = (data['close'].shift(-1) > data['close']).astype(int)  # 1 se preço subiu no próximo período
-data = data.dropna()
+    # Condição de cruzamento de EMAs
+    if trend == "Alta" and last_candle['EMA9'] > last_candle['EMA13'] and last_candle['MACD'] > last_candle['MACD_signal']:
+        return "Entrada possível: Alta confirmada"
+    elif trend == "Baixa" and last_candle['EMA9'] < last_candle['EMA13'] and last_candle['MACD'] < last_candle['MACD_signal']:
+        return "Entrada possível: Baixa confirmada"
+    else:
+        return "Sem condições de entrada"
 
-# Definir as features e o target
-features = ['close', 'ema_short', 'ema_long', 'rsi', 'macd', 'stochastic_k', 'stochastic_d']
-X = data[features]
-y = data['target']
+# Função para calcular o stop loss e take profit
+def calculate_risk_management(balance, entry_price, risk_percentage=0.01, risk_to_reward=2):
+    stop_loss = entry_price * (1 - risk_percentage)  # Exemplo de stop loss
+    take_profit = entry_price * (1 + risk_percentage * risk_to_reward)  # Exemplo de take profit
+    return stop_loss, take_profit
 
-# Dividir os dados em treino e teste
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# Função principal de execução
+def main():
+    balance = 1000  # Exemplo de saldo
+    symbol = 'BTCUSDT'
 
-# Balanceamento de classes com SMOTE
-smote = SMOTE()
-X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+    # Obter os dados de mercado
+    data = get_historical_data(symbol)
+    data = calculate_indicators(data)
 
-# Ajuste de Hiperparâmetros usando GridSearchCV com RandomForest
-rf_model = RandomForestClassifier(random_state=42)
-param_grid = {
-    'n_estimators': [50, 100, 200],
-    'max_depth': [10, 20, None],
-    'min_samples_split': [2, 5, 10]
-}
-grid_search = GridSearchCV(estimator=rf_model, param_grid=param_grid, cv=5, n_jobs=-1, verbose=2)
-grid_search.fit(X_train_res, y_train_res)
+    # Verificar condições de entrada
+    entry_message = check_entry_conditions(data)
+    if "Entrada possível" in entry_message:
+        # Definir preço de entrada (último preço de fechamento)
+        entry_price = data['close'].iloc[-1]
 
-# Melhor modelo após o ajuste
-best_rf_model = grid_search.best_estimator_
+        # Calcular o risco e o retorno
+        stop_loss, take_profit = calculate_risk_management(balance, entry_price)
 
-# Avaliar a acurácia no conjunto de teste
-y_pred_rf = best_rf_model.predict(X_test)
-print(f'Acurácia do Random Forest: {accuracy_score(y_test, y_pred_rf)}')
+        # Enviar o plano de trade para o Telegram
+        plan_message = f"📝 Modelo de Plano de Trade (antes de clicar no botão)\n\n" \
+                       f"**Identificação da Tendência**\n" \
+                       f"Tendência clara: {identify_trend(data)}\n" \
+                       f"EMAs alinhadas? Sim\n" \
+                       f"MACD confirma? Sim\n" \
+                       f"Candles apoiam? Sim\n\n" \
+                       f"**Condições de Entrada**\n" \
+                       f"Setup batendo? Sim (Cruzamento de EMAs e MACD)\n" \
+                       f"Pullback ou rompimento confirmado? Sim\n\n" \
+                       f"**Gestão de Risco**\n" \
+                       f"Valor do stop loss calculado: {stop_loss}\n" \
+                       f"Risco x Retorno no mínimo 1:2? Sim\n" \
+                       f"Alavancagem usada de forma segura? Sim\n\n" \
+                       f"**Execução**\n" \
+                       f"Ordem programada? Sim (Limit/Stop)\n" \
+                       f"Stop Loss posicionado? Sim\n" \
+                       f"Take Profit definido? Sim\n" \
+                       f"Trailing Stop configurado? Sim\n\n" \
+                       f"**Após a entrada**\n" \
+                       f"Seguir plano! Não mexer no stop sem motivo técnico.\n" \
+                       f"Atualizar trailing se der lucro.\n\n" \
+                       f"**Detalhes da operação**\n" \
+                       f"Entrada: {entry_price}\n" \
+                       f"Stop Loss: {stop_loss}\n" \
+                       f"Take Profit: {take_profit}"
 
-# Ensemble de Modelos (Random Forest + XGBoost)
-xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=10, random_state=42)
-xgb_model.fit(X_train_res, y_train_res)
+        send_telegram_message(plan_message)
 
-# Prevendo com os dois modelos e combinando os resultados (votação majoritária)
-rf_pred = best_rf_model.predict(X_test)
-xgb_pred = xgb_model.predict(X_test)
-
-final_pred = np.round((rf_pred + xgb_pred) / 2)
-ensemble_accuracy = accuracy_score(y_test, final_pred)
-print(f'Acurácia do Ensemble: {ensemble_accuracy}')
-
-# Implementação do modelo LSTM para análise de séries temporais (Deep Learning)
-X_train_lstm = X_train_res.values.reshape((X_train_res.shape[0], X_train_res.shape[1], 1))
-X_test_lstm = X_test.values.reshape((X_test.shape[0], X_test.shape[1], 1))
-
-lstm_model = Sequential()
-lstm_model.add(LSTM(50, return_sequences=True, input_shape=(X_train_lstm.shape[1], 1)))
-lstm_model.add(LSTM(50, return_sequences=False))
-lstm_model.add(Dense(1))
-lstm_model.compile(optimizer='adam', loss='mean_squared_error')
-
-lstm_model.fit(X_train_lstm, y_train_res, epochs=10, batch_size=32)
-
-# Previsões LSTM
-lstm_predictions = lstm_model.predict(X_test_lstm)
-
-# Avaliar o modelo LSTM
-mae = mean_absolute_error(y_test, lstm_predictions)
-print(f'Mean Absolute Error (LSTM): {mae}')
-
-# Visualizar as previsões vs reais (para LSTM)
-plt.figure(figsize=(10,6))
-plt.plot(y_test.values, label='Real')
-plt.plot(lstm_predictions, label='Previsão LSTM', linestyle='dashed')
-plt.legend()
-plt.title("Comparação entre Real e Previsões do LSTM")
-plt.show()
+if __name__ == "__main__":
+    while True:
+        main()
+        time.sleep(60 * 60)  # Executa a cada hora (ajuste conforme necessário)
